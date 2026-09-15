@@ -1,0 +1,18 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html {
+  font-family: var(--font-sans);
+}
+
+body {
+  margin: 0;
+}
