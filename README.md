@@ -5,19 +5,26 @@ credits. Everything runs locally using the Canvas API, so your images never leav
 
 ## Tools
 
-- **Batch Convert & Resize** (live) — convert TIFF, PNG, JPG, WEBP, BMP, GIF, and AVIF files in
-  bulk, resize them all with one set of settings, and download everything as a single ZIP.
-  Purpose-built for workflows like converting a folder of TIF exports to PNG/JPEG and resizing
-  them in one pass.
+- **Batch Convert & Resize** (live) — convert TIFF, PDF, PNG, JPG, WEBP, BMP, GIF, and AVIF files
+  in bulk, set DPI and quality, resize them all with one set of settings, and download everything
+  as a single ZIP. Purpose-built for workflows like converting a folder of TIF exports to
+  PNG/JPEG and resizing them in one pass.
 - More tools (compress, rename, crop, …) are planned — see `src/lib/tools.ts`.
 
 ## Why client-side?
 
-Every conversion happens in your browser via `<canvas>` and the [UTIF.js](https://github.com/photopea/UTIF.js)
-TIFF decoder. Nothing is uploaded anywhere, so it's safe for confidential/company images, there's
-no file-size limit imposed by a server, and there's nothing to pay for or rate-limit.
+Every conversion happens in your browser via `<canvas>`, the [UTIF.js](https://github.com/photopea/UTIF.js)
+TIFF decoder, and [pdf.js](https://mozilla.github.io/pdf.js/) for PDFs. Nothing is uploaded
+anywhere, so it's safe for confidential/company images, there's no file-size limit imposed by a
+server, and there's nothing to pay for or rate-limit.
 
-Note: multi-page TIFFs are converted using only their first page.
+Notes:
+- Multi-page TIFFs are converted using only their first page.
+- Multi-page PDFs convert **every page** into its own image (`name-page-1.png`, `name-page-2.png`, …).
+- **DPI** controls the actual rendered pixel resolution for PDF pages (higher DPI = larger,
+  sharper output). For existing raster images it's written as metadata only (a `pHYs` chunk for
+  PNG, a JFIF density header for JPEG) — pixel dimensions for those come from the Resize setting.
+  WEBP has no widely-supported DPI tag, so it's skipped there.
 
 ## Local development
 

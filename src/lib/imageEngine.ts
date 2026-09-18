@@ -1,5 +1,7 @@
 import * as UTIF from 'utif2';
 import type { ConvertSettings, OutputFormat, ResizeSettings } from './types';
+import { injectDpi } from './dpiMetadata';
+import { PDF_EXTENSION } from './pdfDetect';
 
 const TIFF_EXTENSIONS = ['.tif', '.tiff'];
 
@@ -13,6 +15,7 @@ export const ACCEPTED_EXTENSIONS = [
   '.bmp',
   '.gif',
   '.avif',
+  PDF_EXTENSION,
 ];
 
 export function isTiff(file: File): boolean {
@@ -115,7 +118,7 @@ export function computeTargetSize(
   };
 }
 
-function resizeCanvas(
+export function resizeCanvas(
   source: HTMLCanvasElement,
   targetWidth: number,
   targetHeight: number,
@@ -134,7 +137,7 @@ function resizeCanvas(
   return canvas;
 }
 
-function canvasToBlob(
+export function canvasToBlob(
   canvas: HTMLCanvasElement,
   format: OutputFormat,
   quality: number,
@@ -165,7 +168,8 @@ export async function convertImage(
   const decoded = await decodeImage(file);
   const target = computeTargetSize(decoded.width, decoded.height, settings.resize);
   const finalCanvas = resizeCanvas(decoded.canvas, target.width, target.height);
-  const blob = await canvasToBlob(finalCanvas, settings.format, settings.quality);
+  const encoded = await canvasToBlob(finalCanvas, settings.format, settings.quality);
+  const blob = await injectDpi(encoded, settings.dpi, mimeForFormat(settings.format));
   const filename = `${stripExtension(file.name)}.${extensionForFormat(settings.format)}`;
   return { blob, filename, width: target.width, height: target.height };
 }

@@ -7,11 +7,13 @@ import {
   extensionForFormat,
   stripExtension,
 } from '../lib/imageEngine';
+import { isPdf } from '../lib/pdfDetect';
 import { runWithConcurrency } from '../lib/pool';
 import type { ConvertSettings, OutputFormat, QueueItem, ResizeMode } from '../lib/types';
 import { downloadAsZip } from '../lib/zipExport';
 
 const CONCURRENCY = 3;
+const DPI_PRESETS = [72, 150, 300, 600];
 
 function newId(): string {
   return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -20,6 +22,10 @@ function newId(): string {
 function hasAcceptedExtension(filename: string): boolean {
   const lower = filename.toLowerCase();
   return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }
 
 function formatBytes(bytes: number): string {
@@ -31,6 +37,7 @@ function formatBytes(bytes: number): string {
 const defaultSettings: ConvertSettings = {
   format: 'png',
   quality: 0.9,
+  dpi: 150,
   resize: {
     mode: 'none',
     width: 1920,
@@ -51,39 +58,76 @@ export default function ConvertResize() {
   const errorCount = useMemo(() => queue.filter((i) => i.status === 'error').length, [queue]);
   const processedCount = doneCount + errorCount;
 
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const accepted = Array.from(files).filter((f) => hasAcceptedExtension(f.name));
-    if (!accepted.length) return;
+  const patchItem = (id: string, patch: Partial<QueueItem>) => {
+    setQueue((prev) => prev.map((q) => (q.id === id ? { ...q, ...patch } : q)));
+  };
 
-    const items: QueueItem[] = accepted.map((file) => ({
-      id: newId(),
-      file,
-      status: 'queued',
-    }));
-    setQueue((prev) => [...prev, ...items]);
+  const analyzeRasterItem = useCallback((id: string, file: File) => {
+    analyzeFile(file)
+      .then(({ width, height, thumbnailUrl }) => {
+        patchItem(id, { sourceWidth: width, sourceHeight: height, previewUrl: thumbnailUrl });
+      })
+      .catch((err: unknown) => {
+        patchItem(id, { status: 'error', error: errorMessage(err, 'Could not read file.') });
+      });
+  }, []);
 
-    for (const item of items) {
-      analyzeFile(item.file)
-        .then(({ width, height, thumbnailUrl }) => {
-          setQueue((prev) =>
-            prev.map((q) =>
-              q.id === item.id
-                ? { ...q, sourceWidth: width, sourceHeight: height, previewUrl: thumbnailUrl }
-                : q,
-            ),
-          );
+  const analyzePdfPageItem = useCallback((id: string, file: File, pageNumber: number) => {
+    import('../lib/pdfEngine')
+      .then(({ analyzePdfPage }) => analyzePdfPage(file, pageNumber))
+      .then(({ width, height, thumbnailUrl }) => {
+        patchItem(id, { sourceWidth: width, sourceHeight: height, previewUrl: thumbnailUrl });
+      })
+      .catch((err: unknown) => {
+        patchItem(id, { status: 'error', error: errorMessage(err, 'Could not render page.') });
+      });
+  }, []);
+
+  const expandPdfItem = useCallback(
+    (id: string, file: File) => {
+      import('../lib/pdfEngine')
+        .then(({ getPdfPageCount }) => getPdfPageCount(file))
+        .then((pageCount) => {
+          const pageItems: QueueItem[] = Array.from({ length: pageCount }, (_, i) => ({
+            id: newId(),
+            file,
+            pdfPage: { pageNumber: i + 1, pageCount },
+            status: 'queued' as const,
+          }));
+          setQueue((prev) => prev.flatMap((q) => (q.id === id ? pageItems : [q])));
+          for (const pageItem of pageItems) {
+            analyzePdfPageItem(pageItem.id, file, pageItem.pdfPage!.pageNumber);
+          }
         })
         .catch((err: unknown) => {
-          setQueue((prev) =>
-            prev.map((q) =>
-              q.id === item.id
-                ? { ...q, status: 'error', error: err instanceof Error ? err.message : 'Could not read file.' }
-                : q,
-            ),
-          );
+          patchItem(id, { status: 'error', error: errorMessage(err, 'Could not read PDF.') });
         });
-    }
-  }, []);
+    },
+    [analyzePdfPageItem],
+  );
+
+  const addFiles = useCallback(
+    (files: FileList | File[]) => {
+      const accepted = Array.from(files).filter((f) => hasAcceptedExtension(f.name));
+      if (!accepted.length) return;
+
+      const items: QueueItem[] = accepted.map((file) => ({
+        id: newId(),
+        file,
+        status: 'queued',
+      }));
+      setQueue((prev) => [...prev, ...items]);
+
+      for (const item of items) {
+        if (isPdf(item.file)) {
+          expandPdfItem(item.id, item.file);
+        } else {
+          analyzeRasterItem(item.id, item.file);
+        }
+      }
+    },
+    [analyzeRasterItem, expandPdfItem],
+  );
 
   const onFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) addFiles(e.target.files);
@@ -122,33 +166,23 @@ export default function ConvertResize() {
 
     await runWithConcurrency(targets, CONCURRENCY, async (item) => {
       try {
-        const result = await convertImage(item.file, settings);
-        setQueue((prev) =>
-          prev.map((q) =>
-            q.id === item.id
-              ? {
-                  ...q,
-                  status: 'done',
-                  outputBlob: result.blob,
-                  outputName: result.filename,
-                  outputWidth: result.width,
-                  outputHeight: result.height,
-                }
-              : q,
-          ),
-        );
+        const result = item.pdfPage
+          ? await (await import('../lib/pdfEngine')).convertPdfPage(
+              item.file,
+              item.pdfPage.pageNumber,
+              item.pdfPage.pageCount,
+              settings,
+            )
+          : await convertImage(item.file, settings);
+        patchItem(item.id, {
+          status: 'done',
+          outputBlob: result.blob,
+          outputName: result.filename,
+          outputWidth: result.width,
+          outputHeight: result.height,
+        });
       } catch (err) {
-        setQueue((prev) =>
-          prev.map((q) =>
-            q.id === item.id
-              ? {
-                  ...q,
-                  status: 'error',
-                  error: err instanceof Error ? err.message : 'Conversion failed.',
-                }
-              : q,
-          ),
-        );
+        patchItem(item.id, { status: 'error', error: errorMessage(err, 'Conversion failed.') });
       }
     });
 
@@ -175,7 +209,10 @@ export default function ConvertResize() {
     URL.revokeObjectURL(url);
   };
 
-  const previewName = (name: string) => `${stripExtension(name)}.${extensionForFormat(settings.format)}`;
+  const expectedOutputName = (item: QueueItem) => {
+    const suffix = item.pdfPage && item.pdfPage.pageCount > 1 ? `-page-${item.pdfPage.pageNumber}` : '';
+    return `${stripExtension(item.file.name)}${suffix}.${extensionForFormat(settings.format)}`;
+  };
 
   return (
     <div className="mx-auto max-w-5xl px-4 sm:px-6 py-10">
@@ -186,8 +223,9 @@ export default function ConvertResize() {
         Batch Convert &amp; Resize
       </h1>
       <p className="mt-2 text-neutral-600 dark:text-neutral-400 max-w-2xl">
-        Drop in TIFF, PNG, JPG, WEBP, BMP, GIF or AVIF files. Set the output format and size once,
-        convert the whole batch, and download it all as a ZIP. Nothing leaves your browser.
+        Drop in TIFF, PDF, PNG, JPG, WEBP, BMP, GIF or AVIF files. Set the output format, DPI and
+        size once, convert the whole batch, and download it all as a ZIP. Nothing leaves your
+        browser.
       </p>
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
@@ -207,7 +245,7 @@ export default function ConvertResize() {
                 : 'border-neutral-300 dark:border-neutral-700 hover:border-violet-400'
             }`}
           >
-            <p className="font-medium">Drag &amp; drop images here, or click to browse</p>
+            <p className="font-medium">Drag &amp; drop images or PDFs here, or click to browse</p>
             <p className="mt-1 text-sm text-neutral-500">
               Supports {ACCEPTED_EXTENSIONS.join(', ')}
             </p>
@@ -254,13 +292,21 @@ export default function ConvertResize() {
                       )}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{item.file.name}</p>
+                      <p className="truncate text-sm font-medium">
+                        {item.file.name}
+                        {item.pdfPage && item.pdfPage.pageCount > 1 && (
+                          <span className="font-normal text-neutral-400">
+                            {' '}
+                            — page {item.pdfPage.pageNumber} of {item.pdfPage.pageCount}
+                          </span>
+                        )}
+                      </p>
                       <p className="text-xs text-neutral-500">
-                        {formatBytes(item.file.size)}
+                        {!item.pdfPage && formatBytes(item.file.size)}
                         {item.sourceWidth && ` · ${item.sourceWidth}×${item.sourceHeight}`}
                         {item.status === 'done' &&
                           item.outputWidth &&
-                          ` → ${previewName(item.file.name)} (${item.outputWidth}×${item.outputHeight}, ${formatBytes(
+                          ` → ${expectedOutputName(item)} (${item.outputWidth}×${item.outputHeight}, ${formatBytes(
                             item.outputBlob?.size ?? 0,
                           )})`}
                         {item.status === 'error' && (
@@ -329,6 +375,37 @@ export default function ConvertResize() {
               />
             </div>
           )}
+
+          <label className="mt-5 block text-sm font-medium">DPI</label>
+          <div className="mt-1.5 flex items-center gap-2">
+            <input
+              type="number"
+              min={36}
+              max={1200}
+              value={settings.dpi}
+              onChange={(e) => setSettings((s) => ({ ...s, dpi: Math.max(1, Number(e.target.value)) }))}
+              className="w-20 rounded-lg border border-neutral-200 dark:border-neutral-700 bg-transparent px-2 py-1.5 text-sm"
+            />
+            <div className="flex flex-wrap gap-1.5">
+              {DPI_PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  onClick={() => setSettings((s) => ({ ...s, dpi: preset }))}
+                  className={`rounded-md border px-2 py-1 text-xs ${
+                    settings.dpi === preset
+                      ? 'border-violet-500 bg-violet-50 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300'
+                      : 'border-neutral-200 dark:border-neutral-700 text-neutral-500'
+                  }`}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
+          </div>
+          <p className="mt-1.5 text-xs text-neutral-500">
+            Sets the render resolution for PDF pages. For image files it's written as metadata
+            only — pixel size still comes from Resize below.
+          </p>
 
           <label className="mt-5 block text-sm font-medium">Resize</label>
           <select
@@ -409,8 +486,8 @@ export default function ConvertResize() {
           </button>
 
           <p className="mt-3 text-xs text-neutral-500">
-            Multi-page TIFFs use only the first page. Large batches may take a moment — everything
-            runs on your device.
+            Multi-page TIFFs use only the first page. Multi-page PDFs convert every page into its
+            own image. Large batches may take a moment — everything runs on your device.
           </p>
         </div>
       </div>
